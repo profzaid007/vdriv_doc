@@ -1,0 +1,1232 @@
+// =====================================================================
+// RYDCARE - Target PostgreSQL schema for AdonisJS (version 1)
+// Rebuilt from the PocketBase export + BRD + the review notes.
+//
+// CONVENTIONS
+// - Every id is a UUID (use UUIDv7 so new rows land at the end of the index).
+// - legacy_pocketbase_id keeps the old 15-character PocketBase id for migration.
+//   Drop the column after you have reconciled the data.
+// - Money is numeric(12,2). Dates with time are timestamptz.
+// - Status fields are varchar + a CHECK constraint, NOT native PostgreSQL enums
+//   (a CHECK is much easier to change later). Allowed values are in each comment.
+// - Never hard-delete masters (cities, clients, branches, drivers, users).
+//   Use is_active or status instead, so scope rows never point at nothing.
+// - Adonis creates its own access-token tables for each login guard.
+//   They are not modelled here.
+// - FRANCHISE: a franchise owns cities (cities.franchise_id) and organizations.
+//   Almost every record already carries city_id, so a franchise user is limited to the
+//   cities of their franchise. No franchise_id column is needed on the busy tables.
+//   Empty franchise_id means company owned.
+// - Traccar keeps its own database. Only drivers.traccar_device_id links to it.
+// - Not modelled yet (later phases): driver onboarding assets and deposits,
+//   offboarding checklist, notifications, issues and incidents, driver programme.
+//
+// MODULES
+//  1 Identity and access      6 Client billing
+//  2 Drivers                  7 Driver pay
+//  3 Franchises, organizations, 8 Driver ledger
+//    geography and clients    9 Individual customers and system
+//  4 Work (bookings, trips)
+//  5 Client tariffs
+// =====================================================================
+
+Project rydcare {
+  database_type: 'PostgreSQL'
+  Note: 'RydCare platform target schema. See header comments for conventions.'
+}
+
+// =====================================================================
+// MODULE 1 - IDENTITY AND ACCESS
+// People who log in to the staff and client web apps. Drivers and customers
+// have their own tables and are not here.
+// Permission names (for example booking.create) are written in the code, not in a table.
+// =====================================================================
+
+Table users {
+  id uuid [pk] // user id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase user id
+  name varchar(180) [not null] // full name
+  email varchar(254) [unique] // login email
+  phone varchar(20) [unique] // login phone, used for OTP
+  password_hash text // empty when the user logs in only by OTP
+  user_type varchar(10) [not null, note: 'staff / client'] // staff = your team, client = a client branch user
+  is_active boolean [not null, default: true] // turn off to block login
+  last_login_at timestamptz // last successful login
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    user_type
+  }
+}
+
+Table roles {
+  id uuid [pk] // role id
+  key varchar(60) [not null, unique] // short code used in code, e.g. ops_executive
+  name varchar(120) [not null] // display name, e.g. Ops Executive
+  is_system boolean [not null, default: false] // system roles cannot be deleted
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+Table role_permissions {
+  id uuid [pk] // row id
+  role_id uuid [not null, ref: > roles.id] // which role
+  permission_key varchar(80) [not null] // the action allowed, e.g. booking.create
+  indexes {
+    (role_id, permission_key) [unique]
+  }
+}
+
+// One row says: this user has this role in this place.
+// Example: Arun | ops_executive | city | Madurai
+Table user_scopes {
+  id uuid [pk] // row id
+  user_id uuid [not null, ref: > users.id] // who
+  role_id uuid [not null, ref: > roles.id] // what they can do
+  scope_type varchar(20) [not null, note: 'global / franchise / organization / city / client / branch'] // what kind of place
+  scope_id uuid // franchise, organization, city, client or client_branch id. Empty only for global
+  is_active boolean [not null, default: true] // turn off without deleting
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (user_id, is_active)
+    (user_id, role_id, scope_type, scope_id) [unique]
+  }
+  Note: 'scope_id points to a different table for each scope_type, so PostgreSQL cannot check it. The app must validate it.'
+}
+
+// One-time passwords for staff, driver and customer logins.
+Table otp_codes {
+  id uuid [pk] // row id
+  owner_type varchar(10) [not null, note: 'user / driver / customer'] // which table the owner is in
+  owner_id uuid [not null] // id in that table
+  phone varchar(20) [not null] // phone the code was sent to
+  code_hash text [not null] // store a hash, never the plain code
+  purpose varchar(20) [not null, note: 'login / reset'] // why it was sent
+  attempts integer [not null, default: 0] // wrong tries so far
+  expires_at timestamptz [not null] // after this the code is dead
+  consumed_at timestamptz // set when used
+  created_at timestamptz [not null, default: `now()`] // when sent
+  indexes {
+    (owner_type, owner_id)
+    expires_at
+  }
+}
+
+// Answers "who changed this?". Partition by month once it grows large.
+Table audit_logs {
+  id uuid [pk] // row id
+  actor_type varchar(10) [not null, note: 'user / driver / customer / system'] // who did it
+  actor_id uuid // id of the actor, empty for system
+  action varchar(80) [not null] // e.g. billing.update, payment.mark_paid
+  record_type varchar(60) [not null] // table name the change was on
+  record_id uuid // id of the changed row
+  city_id uuid // lets city scoped users see their own audit trail
+  before_data jsonb // values before the change
+  after_data jsonb // values after the change
+  ip_address varchar(45) // caller address
+  created_at timestamptz [not null, default: `now()`] // when it happened
+  indexes {
+    (record_type, record_id)
+    (actor_id, created_at)
+    created_at
+  }
+}
+
+// =====================================================================
+// MODULE 2 - DRIVERS
+// =====================================================================
+
+// Service / Valet / RTO. The broad kind of work.
+Table job_types {
+  id uuid [pk] // job type id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  type_name varchar(40) [not null, unique] // Service / Valet / RTO
+  description text // free text
+  type_code integer // old numeric code (PocketBase type_id)
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+// How a driver is engaged. This decides the pay cycle and the pay scheme.
+// Seed with: Service, RTO, Valet - Monthly, Valet - Acting, Service - Monthly, Customer.
+Table work_categories {
+  id uuid [pk] // category id
+  job_type_id uuid [ref: > job_types.id] // empty for Customer (individual customer duties)
+  code varchar(40) [not null, unique] // e.g. valet_monthly
+  name varchar(80) [not null] // e.g. Valet - Monthly
+  pay_cycle varchar(20) [not null, note: 'monthly / weekly / on_demand'] // monthly for Service Monthly and Valet Monthly, others weekly or on demand
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+Table drivers {
+  id uuid [pk] // driver id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  driver_code varchar(40) [not null, unique] // the old driver_id field, e.g. NSC-0123
+  driver_name varchar(180) [not null] // full name
+  phone varchar(20) [not null, unique] // login phone, keep leading zeros so use text
+  password_hash text // empty when the driver logs in only by OTP
+  status varchar(25) [not null, default: 'active', note: 'application / documents_pending / verification_pending / ready / active / suspended / offboarded'] // lifecycle from the BRD. Old Active=active, Suspended=suspended, Inactive and Resigned both=offboarded
+  driver_level varchar(20) [note: 'unverified / permanent / temporary'] // from the old driver_level
+  city_id uuid [not null, ref: > cities.id] // home city. Used for booking and scope
+  pinned_branch_id uuid [ref: > client_branches.id] // set when the driver is pinned to one client branch
+  zone_id uuid [ref: > zones.id] // working zone inside the city
+  work_location varchar(180) // old free text work location, keep during migration
+  is_vacant boolean [not null, default: false] // true when free for a new duty
+  traccar_device_id varchar(40) [unique] // links to the device in Traccar
+  is_tracking boolean [not null, default: false] // true when live tracking is on
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (city_id, status)
+    pinned_branch_id
+  }
+  Note: 'trips_count from PocketBase is dropped. Count from trips instead.'
+}
+
+// Replaces the old multi-select work_type and job_type_id fields on drivers.
+Table driver_work_categories {
+  id uuid [pk] // row id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  work_category_id uuid [not null, ref: > work_categories.id] // the category they can work in
+  created_at timestamptz [not null, default: `now()`] // when added
+  indexes {
+    (driver_id, work_category_id) [unique]
+  }
+}
+
+// Old drivers_data. Personal and tax details, one row per driver.
+Table driver_profiles {
+  id uuid [pk] // row id
+  legacy_pocketbase_id varchar(30) [unique] // old drivers_data id
+  driver_id uuid [not null, unique, ref: - drivers.id] // one profile per driver
+  address text // home address
+  pincode varchar(10) // text so leading zeros survive
+  aadhaar_last4 varchar(4) // last 4 digits, safe to show
+  aadhaar_hash text [unique] // hash of the full number, only to catch duplicate drivers
+  dl_number varchar(40) [unique] // driving licence number
+  dl_expiry_date date // licence expiry
+  pan_no varchar(20) // PAN, needed for TDS
+  date_of_join date // joining date
+  date_of_resign date // resign date
+  remarks text // free notes
+  tds_enabled boolean [not null, default: false] // deduct TDS on payments
+  tds_percentage numeric(5,2) // TDS percent when enabled
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+// Replaces the file fields on drivers_data. Files live in S3, only the key is stored.
+Table driver_documents {
+  id uuid [pk] // row id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  doc_type varchar(30) [not null, note: 'driver_license / aadhaar / passbook / address_proof / pan / photo'] // which document
+  storage_key text [not null] // path in the file store
+  status varchar(10) [not null, default: 'pending', note: 'pending / verified / rejected'] // verification state
+  verified_by uuid [ref: > users.id] // staff who checked it
+  verified_at timestamptz // when checked
+  rejection_reason text // why rejected
+  created_at timestamptz [not null, default: `now()`] // when uploaded
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, doc_type)
+  }
+}
+
+// Bank details with history. Payments point at the account that was used.
+Table driver_bank_accounts {
+  id uuid [pk] // row id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  account_holder_name varchar(180) // name on the account
+  account_number_encrypted text [not null] // encrypted in the app, never plain text
+  account_last4 varchar(4) // last 4 digits, safe to show
+  ifsc_code varchar(20) [not null] // bank branch code
+  bank_name varchar(120) // bank name
+  is_primary boolean [not null, default: true] // the account used for payouts
+  valid_from date // when this account became current
+  valid_to date // when it was replaced
+  created_at timestamptz [not null, default: `now()`] // when added
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, is_primary)
+  }
+  Note: 'Only one primary account per driver. Enforce with a partial unique index on driver_id where is_primary is true.'
+}
+
+// A driver can have more than one phone.
+Table driver_devices {
+  id uuid [pk] // row id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  fcm_token text [not null, unique] // push token
+  platform varchar(10) [note: 'android / ios'] // phone type
+  app_version varchar(20) // app version last seen
+  last_seen_at timestamptz // last time this phone connected
+  created_at timestamptz [not null, default: `now()`] // when added
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    driver_id
+  }
+}
+
+// Old driver_daily_report. Each driver says each day what duty they can take.
+Table driver_daily_availability {
+  id uuid [pk] // row id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  availability_date date [not null] // the day
+  availability varchar(10) [not null, note: 'pickup / drop / both / leave'] // what they can do
+  location_id uuid [ref: > locations.id] // where they will be
+  available_from time // from what time
+  remarks text // free notes
+  created_by uuid [ref: > users.id] // staff who entered it, empty if the driver did
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, availability_date) [unique]
+    availability_date
+  }
+}
+
+// =====================================================================
+// MODULE 3 - ORGANIZATIONS, GEOGRAPHY AND CLIENTS
+// Organization = billing entity only (issues invoices).
+// City = main factor for booking and driver assignment.
+// Client has branches. A branch works in exactly one city.
+// =====================================================================
+
+// A partner who runs RydCare in one or more cities. Company owned cities have no franchise.
+// A franchise user sees only the cities of their franchise.
+Table franchises {
+  id uuid [pk] // franchise id
+  name varchar(180) [not null, unique] // e.g. Kovai Drivers
+  contact_name varchar(180) // owner or main contact
+  phone varchar(30) // contact phone
+  email varchar(254) // contact email
+  royalty_percentage numeric(5,2) // share of billing paid to the company, empty if none agreed
+  agreement_start date // agreement starts
+  agreement_end date // agreement ends
+  status varchar(10) [not null, default: 'active', note: 'active / suspended / ended'] // franchise state
+  notes text // free notes
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+// Old companies. Each row is one billing entity, with its own GST number.
+// Example: Nine Star Call Drivers (parent) -> Nine Star Call Drivers - Madurai.
+Table organizations {
+  id uuid [pk] // organization id
+  legacy_pocketbase_id varchar(30) [unique] // old companies id
+  parent_id uuid [ref: > organizations.id] // brand or group this row belongs to, empty for top level
+  franchise_id uuid [ref: > franchises.id] // set when a franchise owns this billing entity, empty = company owned
+  name varchar(180) [not null] // e.g. Nine Star Call Drivers - Madurai
+  short_name varchar(50) // short name
+  invoice_prefix varchar(20) // used in invoice numbers, e.g. NSC-MDU
+  gst_no varchar(30) // may be the same or different for each row
+  pan_no varchar(20) // PAN
+  address text // billing address
+  state varchar(100) // decides CGST/SGST or IGST
+  city varchar(100) // text, for the address only
+  pincode varchar(10) [not null] // text so leading zeros survive
+  email varchar(254) // contact email
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    parent_id
+  }
+}
+
+Table cities {
+  id uuid [pk] // city id
+  name varchar(100) [not null] // e.g. Madurai
+  state varchar(100) [not null] // e.g. Tamil Nadu
+  franchise_id uuid [ref: > franchises.id] // the franchise that runs this city, empty = company owned
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (name, state) [unique]
+    franchise_id
+  }
+}
+
+Table zones {
+  id uuid [pk] // zone id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  city_id uuid [not null, ref: > cities.id] // the city it belongs to
+  name varchar(100) [not null] // zone name
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (city_id, name) [unique]
+  }
+}
+
+// The pick list for dropdowns. Shown when taking a booking and when a driver does a trip.
+// Filter by the city of the booking or driver. If a place is not listed, the free text
+// address fields on bookings and trips can still be used.
+Table locations {
+  id uuid [pk] // location id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  city_id uuid [not null, ref: > cities.id] // the city it belongs to
+  zone_id uuid [ref: > zones.id] // the zone, if any
+  name varchar(180) [not null] // e.g. Chengalpet
+  location_type varchar(15) [not null, default: 'area', note: 'area / rto_office / other'] // lets a dropdown show only areas, or only RTO offices
+  latitude numeric(10,7) // map point
+  longitude numeric(10,7) // map point
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (city_id, name) [unique]
+  }
+}
+
+// Old location_distances. Distance from a client branch to a named location.
+Table branch_location_distances {
+  id uuid [pk] // row id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  client_branch_id uuid [not null, ref: > client_branches.id] // the branch
+  location_id uuid [not null, ref: > locations.id] // the location
+  distance_km numeric(8,2) [not null] // distance in km
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (client_branch_id, location_id) [unique]
+  }
+}
+
+// Gap free numbers for invoices and driver payment documents.
+// Take the next number inside a transaction with the row locked.
+Table document_sequences {
+  id uuid [pk] // row id
+  sequence_key varchar(80) [not null, note: 'e.g. invoice:<organization id> or driver_payment'] // which counter
+  financial_year varchar(9) [not null] // e.g. 2026-2027
+  last_number integer [not null, default: 0] // last number used
+  updated_at timestamptz [not null, default: `now()`] // when last used
+  indexes {
+    (sequence_key, financial_year) [unique]
+  }
+}
+
+Table clients {
+  id uuid [pk] // client id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  client_name varchar(180) [not null] // e.g. Kia
+  address text // head office address
+  city varchar(100) // text, for the address only
+  state varchar(100) // text, for the address only
+  gst_no varchar(30) [unique] // client GST number
+  franchise_id uuid [ref: > franchises.id] // set when a franchise owns this client, empty = head office. Franchise users also see any client that has a branch in their cities
+  phone_1 varchar(30) // main phone
+  phone_2 varchar(30) // second phone
+  status varchar(10) [not null, default: 'active', note: 'active / inactive'] // client state
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+Table client_contacts {
+  id uuid [pk] // row id
+  client_id uuid [not null, ref: > clients.id] // the client
+  client_branch_id uuid [ref: > client_branches.id] // set when the contact is for one branch only
+  name varchar(180) [not null] // contact name
+  designation varchar(100) // job title
+  phone varchar(30) // phone
+  email varchar(254) // email
+  is_primary boolean [not null, default: false] // main contact
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    client_id
+  }
+}
+
+Table client_branches {
+  id uuid [pk] // branch id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  client_id uuid [not null, ref: > clients.id] // the client
+  city_id uuid [not null, ref: > cities.id] // the one city this branch works in
+  organization_id uuid [not null, ref: > organizations.id] // the organization that invoices this branch
+  branch_name varchar(180) [not null] // full branch name
+  short_name varchar(50) [not null] // short name used on bill books
+  full_name varchar(180) // display name
+  slug varchar(180) [unique] // url friendly name
+  location varchar(180) // area name
+  address text // branch address
+  gst_no varchar(30) // branch GST number, if different from the client
+  location_url text // map link
+  latitude numeric(10,7) // map point
+  longitude numeric(10,7) // map point
+  status varchar(10) [not null, default: 'active', note: 'active / inactive'] // branch state
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (client_id, short_name) [unique]
+    city_id
+    organization_id
+  }
+}
+
+// Replaces the old rto / service / valet yes-no fields on branches.
+// A new job type later needs no new column.
+Table client_branch_job_types {
+  id uuid [pk] // row id
+  client_branch_id uuid [not null, ref: > client_branches.id] // the branch
+  job_type_id uuid [not null, ref: > job_types.id] // the work it uses us for
+  indexes {
+    (client_branch_id, job_type_id) [unique]
+  }
+}
+
+// =====================================================================
+// MODULE 4 - WORK (BOOKINGS, TRIPS, BILL BOOKS)
+// The trip is the common source record. Client billing and driver pay
+// are calculated separately from it.
+// =====================================================================
+
+// Duty requests from clients (old bookings).
+Table bookings {
+  id uuid [pk] // booking id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  client_branch_id uuid [not null, ref: > client_branches.id] // which branch asked
+  city_id uuid [not null, ref: > cities.id] // copied from the branch, used for scope
+  job_type_id uuid [not null, ref: > job_types.id] // Service / Valet / RTO
+  booking_date date [not null] // duty day
+  duty_time time // planned start time
+  duty_type varchar(10) [not null, note: 'pickup / drop'] // direction
+  vehicle_no varchar(30) // vehicle number
+  customer_number varchar(30) // phone of the end customer
+  pickup_location_id uuid [ref: > locations.id] // chosen from the dropdown, must be in the same city
+  drop_location_id uuid [ref: > locations.id] // chosen from the dropdown, must be in the same city
+  pickup_place text // address detail or landmark, free text
+  drop_place text // address detail or landmark, free text
+  status varchar(25) [not null, default: 'pending', note: 'pending / assigned / confirmed / ongoing / completed / customer_no_response / customer_cancelled / customer_postponed / vehicle_serviced / company_driver'] // booking state
+  driver_id uuid [ref: > drivers.id] // current driver, copied from the latest assignment
+  notes text // free notes
+  created_by uuid [ref: > users.id] // who created it
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (city_id, booking_date, status)
+    (client_branch_id, booking_date)
+    (driver_id, status)
+  }
+}
+
+// Old booking_driver_history for client bookings: every assignment, accept and replace.
+Table booking_assignments {
+  id uuid [pk] // row id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  booking_id uuid [not null, ref: > bookings.id] // the booking
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  status varchar(15) [not null, note: 'assigned / accepted / rejected / replaced / cancelled'] // what happened
+  booking_status varchar(25) // booking status at that moment (old status field)
+  remarks text // free notes
+  assigned_by uuid [ref: > users.id] // staff who assigned
+  assigned_at timestamptz [not null, default: `now()`] // when assigned
+  responded_at timestamptz // when the driver answered
+  indexes {
+    (booking_id, assigned_at)
+    driver_id
+  }
+}
+
+// One duty done by one driver.
+Table trips {
+  id uuid [pk] // trip id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  booking_id uuid [ref: > bookings.id] // the booking it fulfils, if any
+  driver_id uuid [ref: > drivers.id] // who drove
+  client_branch_id uuid [ref: > client_branches.id] // client branch
+  city_id uuid [ref: > cities.id] // copied from the branch
+  job_type_id uuid [ref: > job_types.id] // Service / Valet / RTO
+  trip_type varchar(10) [note: 'pickup / drop / delivery'] // direction
+  status varchar(15) [not null, default: 'pending', note: 'ongoing / pending / completed / approved'] // same values as PocketBase
+  in_time timestamptz // start time
+  out_time timestamptz // end time
+  check_in_latitude numeric(10,7) // start point
+  check_in_longitude numeric(10,7) // start point
+  check_in_place text // start address text
+  check_out_latitude numeric(10,7) // end point
+  check_out_longitude numeric(10,7) // end point
+  check_out_place text // end address text
+  distance_km numeric(9,2) // distance of the duty
+  distance_source varchar(10) [note: 'traccar / app / manual'] // where the distance came from
+  gate_pass_no varchar(80) // slip or gate pass as typed by the driver
+  pickup_location_id uuid [ref: > locations.id] // chosen from the dropdown, must be in the same city
+  drop_location_id uuid [ref: > locations.id] // chosen from the dropdown, must be in the same city
+  pickup_place text // address detail or landmark, free text
+  drop_place text // address detail or landmark, free text
+  tentative_drop text // expected drop
+  rto_name varchar(180) // RTO office, for RTO duties
+  chassis_no varchar(80) // chassis number
+  vehicle_number varchar(30) // vehicle number
+  customer_confirmed_at timestamptz // when the customer confirmed
+  verification_result varchar(20) [default: 'pending', note: 'pending / normal / review_required'] // from the BRD duty verification
+  verification_notes text // reason for review
+  approved_by uuid [ref: > users.id] // staff who approved
+  approved_at timestamptz // when approved
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, in_time)
+    (client_branch_id, in_time)
+    (city_id, status)
+    booking_id
+  }
+}
+
+// Photos for a trip. Files live in S3, only the key is stored.
+Table trip_files {
+  id uuid [pk] // row id
+  trip_id uuid [not null, ref: > trips.id] // the trip
+  file_kind varchar(20) [not null, note: 'check_in_selfie / check_out_selfie / vehicle_photo / slip_photo'] // what the file is
+  storage_key text [not null] // path in the file store
+  created_at timestamptz [not null, default: `now()`] // when uploaded
+  indexes {
+    (trip_id, file_kind)
+  }
+}
+
+// Books of slip numbers. A bill book groups jobs, it does not calculate tariff.
+Table bill_books {
+  id uuid [pk] // bill book id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  client_branch_id uuid [ref: > client_branches.id] // the branch the book belongs to
+  job_type_id uuid [ref: > job_types.id] // old work_type field
+  name varchar(120) // book name
+  date date // date the book started
+  start_number integer // first slip number
+  end_number integer // last slip number
+  status varchar(10) [note: 'active / inactive'] // book state
+  valet_category varchar(20) [note: 'monthly / acting / monthly-acting'] // keeps the three Monthly Acting books working
+  notes text // free notes
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (client_branch_id, status)
+  }
+}
+
+// =====================================================================
+// MODULE 5 - CLIENT TARIFFS
+// Replaces job_cards, job_card_rules and the four jc_rule_* tables.
+// A tariff card is a named price list for one branch and job type.
+// It holds rule rows. The first matching rule (lowest priority number) wins.
+// Each rule sets both the client bill amount and the driver amount.
+// =====================================================================
+
+Table tariff_cards {
+  id uuid [pk] // tariff card id
+  legacy_pocketbase_id varchar(30) [unique] // old job_cards id
+  client_branch_id uuid [not null, ref: > client_branches.id] // the branch
+  job_type_id uuid [not null, ref: > job_types.id] // Service / Valet / RTO
+  job_code varchar(40) [not null] // old job_code
+  job_name varchar(180) [not null] // old job_name
+  effective_from date // price list starts
+  effective_to date // price list ends, empty means still current
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (client_branch_id, job_code) [unique]
+    (client_branch_id, job_type_id)
+  }
+}
+
+// One table for all four rule types. Fill only the fields that the rule type uses.
+//   flat  : bill_amount, driver_amount
+//   km    : min_km, max_km, bill_amount, driver_amount (calc type per_km means the amount is per km)
+//   hours : base_hours, extra hour rates, night rates and night times
+//   route : match_type, pickup and drop location, optional base hours and extra hour rates
+// Example (Valet, hours rule): base_hours 4, bill_amount 600, bill_extra_hour_rate 100,
+// driver_amount 350, driver_extra_hour_rate 60. A 6 hour duty bills 600 + 2 x 100 = 800
+// and pays the driver 350 + 2 x 60 = 470.
+Table tariff_rules {
+  id uuid [pk] // rule id
+  legacy_pocketbase_id varchar(30) [unique] // id from the old jc_rule_* table
+  tariff_card_id uuid [not null, ref: > tariff_cards.id] // the price list
+  rule_type varchar(10) [not null, note: 'flat / km / hours / route'] // which fields apply
+  priority integer [not null, default: 0] // lowest number is checked first
+  bill_calc_type varchar(10) [not null, default: 'flat', note: 'flat / per_km / route'] // how the client amount is read
+  driver_calc_type varchar(10) [not null, default: 'flat', note: 'flat / per_km / route'] // how the driver amount is read
+  bill_amount numeric(12,2) // what the client pays
+  driver_amount numeric(12,2) // what the driver earns
+  min_km numeric(8,2) // km rule: from distance
+  max_km numeric(8,2) // km rule: up to distance
+  base_hours numeric(5,2) // hours and route rules: hours covered by the base amount
+  bill_extra_hour_rate numeric(12,2) // client rate for each extra hour
+  driver_extra_hour_rate numeric(12,2) // driver rate for each extra hour
+  night_start_time time // night rate starts
+  night_end_time time // night rate ends
+  bill_night_rate numeric(12,2) // client night charge
+  driver_night_rate numeric(12,2) // driver night charge
+  match_type varchar(20) [note: 'same_place / different_place / fixed_route'] // route rule: how pickup and drop are matched
+  pickup_location_id uuid [ref: > locations.id] // route rule: pickup
+  drop_location_id uuid [ref: > locations.id] // route rule: drop
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (tariff_card_id, priority)
+  }
+}
+
+// Old outskirts_pricing. Extra pricing for duties to outskirt locations.
+Table outskirts_rules {
+  id uuid [pk] // rule id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  client_branch_id uuid [not null, ref: > client_branches.id] // the branch
+  job_type_id uuid [not null, ref: > job_types.id] // the work type
+  bill_amount numeric(12,2) [not null] // client amount
+  driver_amount numeric(12,2) [not null, default: 0] // driver amount
+  service_amount numeric(12,2) // service amount from the old field
+  is_additional boolean [not null, default: false] // true means added on top of the normal bill
+  is_flat boolean [not null, default: false] // true means a flat amount instead of the normal tariff
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (client_branch_id, job_type_id)
+  }
+}
+
+// Replaces the old location_outskirts JSON list.
+Table outskirts_rule_locations {
+  id uuid [pk] // row id
+  outskirts_rule_id uuid [not null, ref: > outskirts_rules.id] // the rule
+  location_id uuid [not null, ref: > locations.id] // an outskirt location it covers
+  indexes {
+    (outskirts_rule_id, location_id) [unique]
+  }
+}
+
+// =====================================================================
+// MODULE 6 - CLIENT BILLING
+// A billing row is one completed duty with both amounts:
+// what the client pays and what the driver earns. They are separate numbers.
+// Example: billing 400, driver amount 220.
+// The old yes-no flags are removed. Their meaning now comes from other tables:
+//   is_driver_paid / is_preparing_made = a row exists in driver_payment_billings
+//   is_invoice_paid = the invoice status
+//   is_cancel / is_checked = status below
+// =====================================================================
+
+Table billings {
+  id uuid [pk] // billing id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  trip_id uuid [ref: > trips.id] // the trip, empty for manual entries
+  organization_id uuid [not null, ref: > organizations.id] // the organization that invoices (old company_id)
+  client_branch_id uuid [not null, ref: > client_branches.id] // client branch
+  city_id uuid [not null, ref: > cities.id] // copied from the branch, used for scope
+  bill_book_id uuid [not null, ref: > bill_books.id] // the bill book
+  driver_id uuid [ref: > drivers.id] // who did the duty
+  job_type_id uuid [ref: > job_types.id] // Service / Valet / RTO
+  tariff_card_id uuid [ref: > tariff_cards.id] // price list used (old job_card_id)
+  tariff_rule_id uuid [ref: > tariff_rules.id] // the rule that matched
+  outskirts_rule_id uuid [ref: > outskirts_rules.id] // outskirts rule used, if any
+  invoice_id uuid [ref: > invoices.id] // empty until the duty is invoiced
+  service_date date [not null] // the duty day (old date)
+  gatepass_number integer // slip number from the bill book
+  gatepass_status varchar(10) [note: 'available / used'] // whether this slip number is still free or already used. Crucial, keep
+  pickup_location text // pickup as written
+  drop_location text // drop as written
+  pickup_location_id uuid [ref: > locations.id] // matched pickup location, if known
+  drop_location_id uuid [ref: > locations.id] // matched drop location, if known
+  vehicle_no varchar(30) // vehicle number
+  rto_name varchar(180) // RTO office, for RTO duties
+  in_time timestamptz // duty start
+  out_time timestamptz // duty end
+  total_hours numeric(6,2) // hours worked
+  distance_km numeric(9,2) // distance
+  is_outskirts boolean [not null, default: false] // outskirts pricing applied
+  bill_amount numeric(12,2) [not null, default: 0] // client amount
+  additional_charges numeric(12,2) [not null, default: 0] // extra client charges
+  total_bill_amount numeric(12,2) [not null, default: 0] // bill_amount + additional_charges
+  driver_amount numeric(12,2) [not null, default: 0] // driver earning
+  driver_additional_charges numeric(12,2) [not null, default: 0] // extra driver earning
+  total_driver_amount numeric(12,2) [not null, default: 0] // driver_amount + driver_additional_charges
+  calculation_method varchar(80) // which rule logic ran
+  calculation_breakdown jsonb // inputs and result of the calculation
+  manual_override boolean [not null, default: false] // amounts were typed by hand
+  billing_notes text // free notes
+  status varchar(10) [not null, default: 'draft', note: 'draft / checked / cancelled'] // check state
+  checked_by uuid [ref: > users.id] // staff who checked
+  checked_at timestamptz // when checked
+  created_by uuid [ref: > users.id] // staff who entered it (old entried_by)
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, service_date)
+    (city_id, service_date)
+    (client_branch_id, service_date)
+    (status, service_date)
+    bill_book_id
+    invoice_id
+    (bill_book_id, gatepass_number)
+    (bill_book_id, gatepass_status)
+  }
+  Note: 'Create a partial unique index on (bill_book_id, gatepass_number) where status is not cancelled, so a slip number is not billed twice. Cancelled billings must never be allocated to a driver payment or an invoice.'
+}
+
+Table invoices {
+  id uuid [pk] // invoice id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  organization_id uuid [not null, ref: > organizations.id] // who issues the invoice
+  client_branch_id uuid [not null, ref: > client_branches.id] // who is billed
+  city_id uuid [not null, ref: > cities.id] // copied from the branch
+  invoice_number varchar(40) [not null, unique] // from document_sequences, no gaps
+  invoice_date date [not null] // invoice date
+  period_start date // first duty day covered
+  period_end date // last duty day covered
+  description text // main description line
+  bill_to jsonb // name, GST number and address as they were on the invoice date
+  place_of_supply_state varchar(100) // decides CGST/SGST or IGST
+  subtotal numeric(12,2) [not null, default: 0] // before tax
+  extra_amount numeric(12,2) [not null, default: 0] // extra charge added by staff
+  extra_description text // why the extra charge
+  cgst_percent numeric(5,2) [not null, default: 0] // CGST rate
+  sgst_percent numeric(5,2) [not null, default: 0] // SGST rate
+  igst_percent numeric(5,2) [not null, default: 0] // IGST rate, for clients in another state
+  cgst_amount numeric(12,2) [not null, default: 0] // CGST amount
+  sgst_amount numeric(12,2) [not null, default: 0] // SGST amount
+  igst_amount numeric(12,2) [not null, default: 0] // IGST amount
+  round_off numeric(6,2) [not null, default: 0] // rounding
+  grand_total numeric(12,2) [not null] // final amount
+  amount_paid numeric(12,2) [not null, default: 0] // total received so far, from invoice_payments
+  row_count integer [not null, default: 0] // number of billings on the invoice
+  due_date date // payment due date
+  status varchar(15) [not null, default: 'draft', note: 'draft / finalized / partial_paid / paid / cancelled'] // invoice state
+  cancel_reason text // why cancelled
+  created_by uuid [ref: > users.id] // who created it
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (organization_id, invoice_date)
+    (client_branch_id, status)
+    (city_id, invoice_date)
+  }
+  Note: 'Billings link to the invoice through billings.invoice_id. Once finalized, an invoice is never edited. Cancel and re-issue instead.'
+}
+
+// Replaces the old sections JSON. Summary rows printed on the invoice.
+// Example: line 1 Valet duties, quantity 120, rate 400, amount 48000.
+Table invoice_lines {
+  id uuid [pk] // row id
+  invoice_id uuid [not null, ref: > invoices.id] // the invoice
+  line_no integer [not null] // print order
+  section varchar(80) // group heading, e.g. Valet
+  description text [not null] // line text
+  sac_code varchar(20) // service tax code
+  quantity numeric(10,2) [not null, default: 1] // number of units
+  rate numeric(12,2) [not null, default: 0] // price per unit
+  amount numeric(12,2) [not null] // quantity x rate
+  indexes {
+    (invoice_id, line_no) [unique]
+  }
+}
+
+// Money received from the client. Supports part payments.
+Table invoice_payments {
+  id uuid [pk] // row id
+  invoice_id uuid [not null, ref: > invoices.id] // the invoice
+  amount numeric(12,2) [not null] // cash received
+  tds_deducted numeric(12,2) [not null, default: 0] // TDS the client held back
+  paid_on date [not null] // date received
+  payment_mode varchar(20) [note: 'bank_transfer / upi / cheque / cash'] // how paid
+  reference_number varchar(120) // UTR or cheque number
+  notes text // free notes
+  recorded_by uuid [ref: > users.id] // who recorded it
+  created_at timestamptz [not null, default: `now()`] // when recorded
+  indexes {
+    (invoice_id, paid_on)
+  }
+}
+
+// =====================================================================
+// MODULE 7 - DRIVER PAY
+// One driver_payments row per driver per pay period.
+// Monthly categories (Service Monthly, Valet Monthly) are paid once a month.
+// All other categories are paid weekly or on demand.
+// The pay amounts are worked out from billings (duties) and the scheme and slabs.
+// =====================================================================
+
+// A pay plan for one work category.
+// Example Service Monthly: salary_type fixed, base_amount 23000, duty_pay none.
+// Example Valet Monthly: salary_type per_day, base_amount 23000, non_working_days 4,
+//   duty_pay acting_only. Pay = 23000 / 26 x days worked + acting pay + incentive.
+Table driver_payment_schemes {
+  id uuid [pk] // scheme id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  name varchar(120) [not null, unique] // e.g. Valet - Monthly
+  work_category_id uuid [ref: > work_categories.id] // the category it applies to (replaces driver_job_type and job_types)
+  franchise_id uuid [ref: > franchises.id] // empty = shared by everyone. Set when a franchise has its own pay plan. Put the franchise name in the scheme name
+  salary_type varchar(10) [not null, note: 'none / fixed / per_day'] // none = no salary, fixed = same every month, per_day = base divided by working days x days worked
+  base_amount numeric(12,2) [not null, default: 0] // salary base
+  non_working_days integer [not null, default: 0] // days not counted in a month, 4 gives 26 working days in a 30 day month
+  duty_pay varchar(15) [not null, note: 'all / acting_only / none'] // which duties are paid per duty
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+// A pay level inside a scheme. The driver gets the highest slab (largest sort_order)
+// where every minimum is met. Tiers are exclusive, never added together.
+// Example Service Monthly slabs:
+//   Below 100 duties: salary 23000, waive_deduction false
+//   100+ duties: salary 23000, waive_deduction true
+//   120+ duties: salary 30000, waive_deduction true
+//   150+ duties: salary 35000, extra_trip_rate 250, extra_trip_after 150
+//   200+ duties: same as 150+, company_insurance true
+// Example: 210 duties = 35000 + (210 - 150) x 250 = 50000, insurance paid by the company.
+Table driver_payment_slabs {
+  id uuid [pk] // slab id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  payment_scheme_id uuid [not null, ref: > driver_payment_schemes.id] // the scheme
+  level varchar(80) [not null] // slab name
+  sort_order integer [not null, default: 0] // higher means a better slab
+  min_duties integer [not null, default: 0] // needs at least this many duties
+  min_days integer [not null, default: 0] // needs at least this many days worked
+  min_acting integer [not null, default: 0] // needs at least this many acting duties
+  salary numeric(12,2) [not null, default: 0] // salary at this level
+  incentive numeric(12,2) [not null, default: 0] // flat incentive at this level
+  extra_trip_rate numeric(12,2) [not null, default: 0] // pay for each duty above extra_trip_after
+  extra_trip_after integer [not null, default: 0] // duties counted before the extra rate starts
+  waive_deduction boolean [not null, default: false] // buspass and rent are not deducted
+  company_insurance boolean [not null, default: false] // company pays the insurance premium
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (payment_scheme_id, level) [unique]
+    (payment_scheme_id, sort_order)
+  }
+}
+
+// Which scheme a driver is on, and from when. Old payments keep their old scheme.
+Table driver_payment_scheme_assignments {
+  id uuid [pk] // row id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  payment_scheme_id uuid [not null, ref: > driver_payment_schemes.id] // the scheme
+  base_override numeric(12,2) // use instead of the scheme base amount, for one driver
+  insurance_premium numeric(12,2) [not null, default: 0] // premium the company pays for this driver. It differs per driver. Used when the slab has company_insurance
+  effective_from date [not null] // starts
+  effective_to date // ends, empty means current
+  notes text // free notes
+  created_by uuid [ref: > users.id] // who set it
+  created_at timestamptz [not null, default: `now()`] // when created
+  indexes {
+    (driver_id, effective_from) [unique]
+  }
+}
+
+// Totals: total_earnings = base_pay + duty_pay + incentive + trip_bonus
+//         net_payable = total_earnings - total_deductions
+//         final_payable = net_payable - tds_amount
+// The insurance premium is paid by the company and is NOT in these totals.
+Table driver_payments {
+  id uuid [pk] // payment id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  driver_id uuid [not null, ref: > drivers.id] // who is paid
+  city_id uuid [not null, ref: > cities.id] // copied from the driver, used for scope
+  paying_organization_id uuid [ref: > organizations.id] // organization that pays, empty if not tracked
+  scheme_id uuid [ref: > driver_payment_schemes.id] // scheme used
+  slab_id uuid [ref: > driver_payment_slabs.id] // slab reached
+  work_category_id uuid [ref: > work_categories.id] // category paid under
+  period_type varchar(10) [not null, note: 'monthly / weekly / on_demand'] // pay cycle
+  period_start date [not null] // first duty day paid, e.g. 2026-10-06
+  period_end date [not null] // last duty day paid, e.g. 2026-10-12
+  doc_no varchar(80) [not null, unique] // from document_sequences
+  group_id uuid // optional key to show payments together, no batch table
+  financial_year varchar(9) // e.g. 2026-2027
+  status varchar(10) [not null, default: 'unchecked', note: 'unchecked / checked / cancelled'] // review state
+  checked_by uuid [ref: > users.id] // staff who checked
+  checked_at timestamptz // when checked
+  payment_status varchar(10) [not null, default: 'pending', note: 'pending / paid'] // money state
+  payment_mode varchar(15) [note: 'bank_transfer / upi / cash'] // how paid
+  bank_account_id uuid [ref: > driver_bank_accounts.id] // account paid into
+  paid_at timestamptz // when paid
+  reference_number varchar(120) // bank or UPI reference
+  total_duties integer [not null, default: 0] // duties counted
+  days_worked integer [not null, default: 0] // days worked, from billings
+  acting_duties integer [not null, default: 0] // acting duties counted
+  base_pay numeric(12,2) [not null, default: 0] // salary part
+  duty_pay numeric(12,2) [not null, default: 0] // per duty part
+  incentive numeric(12,2) [not null, default: 0] // incentive
+  trip_bonus numeric(12,2) [not null, default: 0] // extra trips above the threshold
+  total_earnings numeric(12,2) [not null, default: 0] // sum of the four parts above
+  total_deductions numeric(12,2) [not null, default: 0] // sum of driver_payment_deductions
+  net_payable numeric(12,2) [not null, default: 0] // earnings minus deductions
+  tds_percentage numeric(5,2) [not null, default: 0] // TDS percent on this payment date
+  tds_amount numeric(12,2) [not null, default: 0] // TDS amount
+  final_payable numeric(12,2) [not null, default: 0] // what the driver receives
+  insurance_premium numeric(12,2) [not null, default: 0] // premium the company paid, copied from the driver's scheme assignment. Not part of take-home
+  snapshot jsonb [not null, default: '{}'] // inputs, chosen slab, and the step by step calculation
+  notes text // free notes
+  created_by uuid [ref: > users.id] // who generated it
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, period_start, period_end)
+    (payment_status, period_end)
+    (city_id, period_end)
+    group_id
+  }
+  Note: 'Create a partial unique index on (driver_id, period_start, period_end) where status is not cancelled, so a driver cannot be paid twice for the same period. Lock the row once payment_status is paid.'
+}
+
+// Which duties are in a payment. billing_id is unique, so a duty is paid only once.
+// Delete these rows when a payment is cancelled so the duties become payable again.
+Table driver_payment_billings {
+  id uuid [pk] // row id
+  driver_payment_id uuid [not null, ref: > driver_payments.id] // the payment
+  billing_id uuid [not null, unique, ref: - billings.id] // the duty
+  counted_as varchar(15) [not null, note: 'paid_duty / acting_paid / counted_only'] // paid per duty, acting duty paid, or only counted for slab or incentive
+  amount numeric(12,2) [not null, default: 0] // paid for this duty, 0 when counted_only
+  created_at timestamptz [not null, default: `now()`] // when added
+  indexes {
+    driver_payment_id
+  }
+}
+
+// What was deducted in a payment, line by line.
+// Example (Service Monthly, 92 duties): buspass 1200 and rent 3000 give total_deductions 4200.
+// Example (105 duties): the same rows with amount 0 and waived_amount 1200 and 3000.
+Table driver_payment_deductions {
+  id uuid [pk] // row id
+  driver_payment_id uuid [not null, ref: > driver_payments.id] // the payment
+  deduction_type_id uuid [not null, ref: > driver_deduction_types.id] // buspass, rent, advance, damage ...
+  driver_deduction_id uuid [ref: > driver_deductions.id] // set when it is an instalment of a loan style deduction
+  deduction_entry_id uuid [ref: > driver_deduction_entries.id] // set when it came from a monthly entry
+  amount numeric(12,2) [not null, default: 0] // amount actually deducted
+  waived_amount numeric(12,2) [not null, default: 0] // amount waived by the slab or by staff
+  notes text // free notes
+  created_at timestamptz [not null, default: `now()`] // when added
+  indexes {
+    driver_payment_id
+  }
+}
+
+Table driver_deduction_types {
+  id uuid [pk] // type id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  name varchar(120) [not null, unique] // e.g. Buspass, Rent, Advance, Uniform
+  frequency varchar(10) [not null, note: 'one_time / monthly'] // how often it applies
+  is_active boolean [not null, default: true] // turn off to retire
+  is_refundable boolean [not null, default: false] // can be returned at offboarding
+  is_waivable boolean [not null, default: false] // can be waived by a slab
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+// Loan style deductions: a total recovered in instalments.
+Table driver_deductions {
+  id uuid [pk] // row id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  deduction_type_id uuid [not null, ref: > driver_deduction_types.id] // the type
+  client_branch_id uuid [ref: > client_branches.id] // branch, if the cost came from one
+  customer_booking_id uuid [ref: > customer_bookings.id] // customer trip, if the cost came from one
+  total_amount numeric(12,2) [not null] // full amount to recover
+  remaining_amount numeric(12,2) [not null] // still to recover, never below 0
+  installment_amount numeric(12,2) [not null, default: 0] // recovered each pay period
+  start_date date [not null] // recovery starts
+  end_date date // recovery ends
+  status varchar(10) [not null, default: 'active', note: 'active / paused / completed'] // state
+  notes text // free notes
+  created_by uuid [ref: > users.id] // who created it
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, status)
+  }
+}
+
+// Amounts that change every month, such as buspass and rent.
+// Staff enter the amount for the month. Payroll picks it up.
+Table driver_deduction_entries {
+  id uuid [pk] // row id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  deduction_type_id uuid [not null, ref: > driver_deduction_types.id] // e.g. Buspass
+  period_month date [not null] // first day of the month, e.g. 2026-10-01
+  amount numeric(12,2) [not null] // amount for that month
+  status varchar(10) [not null, default: 'pending', note: 'pending / applied / waived'] // pending until a payment uses it
+  notes text // free notes
+  created_by uuid [ref: > users.id] // who entered it
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (driver_id, deduction_type_id, period_month) [unique]
+  }
+}
+
+// =====================================================================
+// MODULE 8 - DRIVER LEDGER
+// Balance rule: a positive balance means the company owes the driver.
+// A credit raises the balance. A debit lowers it.
+// The log is append only. To correct a row, add a reversal row. Never edit.
+// =====================================================================
+
+// Cached summary, one row per driver. Rebuild it from the log if it ever looks wrong.
+Table driver_finances {
+  id uuid [pk] // row id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  driver_id uuid [not null, unique, ref: - drivers.id] // one row per driver
+  current_balance numeric(12,2) [not null, default: 0] // positive = company owes driver, negative = driver owes company
+  total_earnings numeric(12,2) [not null, default: 0] // all credits for earnings and incentives
+  total_deductions numeric(12,2) [not null, default: 0] // all deductions and recoveries
+  total_paid numeric(12,2) [not null, default: 0] // all payouts
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+Table driver_finances_log {
+  id uuid [pk] // entry id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  direction varchar(6) [not null, note: 'credit / debit'] // credit raises the balance, debit lowers it
+  category varchar(15) [not null, note: 'earning / incentive / refund / advance / deduction / recovery / payout / adjustment'] // from the BRD credits and debits
+  amount numeric(12,2) [not null] // always positive. The direction gives the sign
+  balance_after numeric(12,2) // balance after this entry
+  driver_payment_id uuid [ref: > driver_payments.id] // payment that caused it
+  driver_deduction_id uuid [ref: > driver_deductions.id] // deduction that caused it
+  deduction_entry_id uuid [ref: > driver_deduction_entries.id] // monthly entry that caused it
+  customer_booking_id uuid [ref: > customer_bookings.id] // customer trip that caused it
+  reverses_log_id uuid [ref: > driver_finances_log.id] // set when this entry cancels an earlier one
+  notes text // free notes
+  created_by uuid [ref: > users.id] // who or what created it, empty for the monthly job
+  created_at timestamptz [not null, default: `now()`] // when posted
+  indexes {
+    (driver_id, created_at)
+    driver_payment_id
+  }
+  Note: 'Partition by month once past about 50 million rows.'
+}
+
+// =====================================================================
+// MODULE 9 - INDIVIDUAL CUSTOMERS AND SYSTEM
+// =====================================================================
+
+Table customers {
+  id uuid [pk] // customer id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  name varchar(180) // full name
+  phone varchar(20) [not null, unique] // login phone, text so leading zeros survive
+  email varchar(254) // email
+  address text // address
+  default_vehicle_no varchar(30) // usual vehicle number
+  password_hash text // empty when the customer logs in only by OTP
+  is_active boolean [not null, default: true] // turn off to block login
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  Note: 'trip_count from PocketBase is dropped. Count from customer_bookings instead.'
+}
+
+// Price lists for individual customers.
+Table customer_tariffs {
+  id uuid [pk] // tariff id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  city_id uuid [ref: > cities.id] // empty means every city
+  name varchar(120) [not null] // tariff name
+  tariff_type varchar(12) [not null, note: 'hourly / daily / outstation / flat'] // kind of tariff
+  company_share_percentage numeric(5,2) // percent of the trip amount the company keeps (old deduction_percentage)
+  base_amount numeric(12,2) // base price
+  base_hours numeric(5,2) // hours covered by the base price
+  extra_hour_rate numeric(12,2) // price for each extra hour (old extra_hours field)
+  minimum_days integer // minimum days for daily tariffs
+  base_day_rate numeric(12,2) // rate per day
+  extra_day_rate numeric(12,2) // rate per extra day
+  night_charges numeric(12,2) // night charge
+  surcharge numeric(12,2) // surcharge
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}
+
+Table customer_bookings {
+  id uuid [pk] // booking id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  customer_id uuid [ref: > customers.id] // the customer
+  customer_tariff_id uuid [ref: > customer_tariffs.id] // tariff used
+  city_id uuid [not null, ref: > cities.id] // city of the booking
+  driver_id uuid [ref: > drivers.id] // current driver
+  status varchar(20) [not null, default: 'pending', note: 'pending / assigned / confirmed / ongoing / completed / payment_received / customer_cancelled'] // booking state
+  booking_type varchar(10) [note: 'current / advance'] // now or later
+  scheduled_at timestamptz // booked time (old booking_date)
+  customer_name varchar(180) // name as given at booking
+  contact_number varchar(30) // phone as given at booking
+  vehicle_no varchar(30) // vehicle number
+  address text // customer address
+  pickup_location_id uuid [ref: > locations.id] // chosen from the dropdown, must be in the same city
+  drop_location_id uuid [ref: > locations.id] // chosen from the dropdown, must be in the same city
+  pickup_place text // address detail or landmark, free text
+  drop_place text // address detail or landmark, free text
+  duty_type varchar(80) // kind of duty, free text in PocketBase
+  start_otp varchar(20) // code the customer gives to start (expires with the booking)
+  end_otp varchar(20) // code the customer gives to end
+  check_in_selfie_key text // file store key
+  check_out_selfie_key text // file store key
+  start_time timestamptz // actual start
+  end_time timestamptz // actual end
+  duration numeric(10,2) // length of the duty in duration_unit
+  duration_unit varchar(5) [note: 'hours / days'] // old rows: hourly tariff = hours, daily or outstation tariff = days. New rows: work it out from start_time and end_time
+  trip_amount numeric(12,2) [not null, default: 0] // what the customer pays
+  driver_amount numeric(12,2) [not null, default: 0] // what the driver earns
+  customer_payment_status varchar(10) [note: 'pending / paid'] // customer payment
+  customer_payment_mode varchar(10) [note: 'cash / upi'] // how the customer paid
+  notes text // free notes
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (city_id, status)
+    (driver_id, status)
+    customer_id
+  }
+}
+
+// Old booking_driver_history for customer bookings.
+Table customer_booking_assignments {
+  id uuid [pk] // row id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  customer_booking_id uuid [not null, ref: > customer_bookings.id] // the booking
+  driver_id uuid [not null, ref: > drivers.id] // the driver
+  status varchar(15) [not null, note: 'assigned / accepted / rejected / replaced / cancelled'] // what happened
+  booking_status varchar(20) // booking status at that moment
+  remarks text // free notes
+  assigned_by uuid [ref: > users.id] // staff who assigned
+  assigned_at timestamptz [not null, default: `now()`] // when assigned
+  responded_at timestamptz // when the driver answered
+  indexes {
+    (customer_booking_id, assigned_at)
+  }
+}
+
+// Settings that can differ by franchise or city, so no city rule is ever hardcoded.
+// The app looks for the city first, then the franchise, then global.
+// Examples: payroll_day, default_gst_percent, feature.live_map.
+Table app_settings {
+  id uuid [pk] // row id
+  setting_key varchar(80) [not null] // name of the setting
+  scope_type varchar(10) [not null, note: 'global / franchise / city'] // where it applies
+  scope_id uuid // franchise or city id, empty for global
+  value jsonb [not null] // the value, e.g. 25 or true
+  updated_by uuid [ref: > users.id] // who changed it
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+  indexes {
+    (setting_key, scope_type, scope_id) [unique]
+  }
+}
+
+// Old email_templates.
+Table message_templates {
+  id uuid [pk] // template id
+  legacy_pocketbase_id varchar(30) [unique] // old PocketBase id
+  name varchar(120) [not null, unique] // template name
+  channel varchar(10) [not null, default: 'email', note: 'email / sms / whatsapp / push'] // where it is sent
+  subject varchar(200) // email subject
+  body text [not null] // message text
+  is_active boolean [not null, default: true] // turn off to retire
+  created_at timestamptz [not null, default: `now()`] // when created
+  updated_at timestamptz [not null, default: `now()`] // when last changed
+}

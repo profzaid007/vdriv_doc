@@ -31,73 +31,18 @@ Future Addition : End customers / General Public (Round-trip, Incity, Only Drop 
 
 ### 3) Channels:
 
-Current communication channels for Clients / Drivers:
-- Whatsapp texts
-- Phone Calls
-- Emails - for Clients
-
-Marketing Channels for Clients:
-- Direct existing client referral
-- Approaching Clients in person
-
-Marketing Channels for Drivers:
-- Newspaper AD
-- WorkIndia ADs
-- Direct Driver Referrals
-
-Potential unused Channels:
-- Instagram
-- Facebook
-- Google Business
-- Rydcare Website
-
-Future Channels:
-- Rydcare Client Portal / CRM
-- Digital Marketing
-- Referral Program
+- Direct Selling to Corporates - Car dealerships , showroom , service center etc
+- Website or Social Media / Digital Marketing
+- Mobile app - Driver app / Customer App
 
 <div style="page-break-after: always;"></div>
 
 ### 4) Customer Relationships:
 
-#### Current Scenario: Almost Nil
-
-Corporate clients:
-- WhatsApp Groups / Chat and Phone support for Daily Booking coordination, Driver allocation
-- Accident Resolution
-- Monthly billing / Invoice doubt clearing
-
-Drivers:
-- Phone and Whatsapp Support - Unmonitored 
-
-End Customers:
-- Phone and Whatsapp Support
-
-Immediate next set of needed actions:
-
-- Client Onboarding - Tariffs -> Quotations -> Confirmation -> Agreement Signing
-- Client-specific SOPs 
-- Issue resolution via tickets to ensure concerns are not missed for both driver and customer
-- Regular operational reviews and Feedback
-
-#### Future Scenario:
-
-End Customer:
-
-- Platform to book driver
-- Their trips gets fulfilled
-- Billing and CRM to resolve their Issues
-
-Corporate Client logs into RydCare and:
-
-- Create booking
-- Track driver
-- View trips
-- Download invoices
-- See driver performance
-- View branch reports
-- View tariffs
-- Raise issues
+- Relationship Manager / Supervisor for a set of Corporates
+- 24/7 On call support and issue resolution
+- Proper Driver fulfillment in accordance to the need
+- Routine client feedback and improvements 
 
 ### 5) Revenue Streams:
 
@@ -109,158 +54,45 @@ Corporate Client logs into RydCare and:
 
 ### 6) Resources:
 
-#### Human-Depandant Resources:
-- A Pool of Drivers
-- Supervisors team
-- Call Center Team
-- Accounts Team
-- One Proprietor
-
-#### Business Assets:
-- Corporate Clients
+- Professinal Drivers
+- Mobile app and web platform
 - Brand reputation
-- Groundwork experience
-- Pricing and Tariff knowledge
-- Driver Network
-
-#### Financial Resources:
-- Current ongoing capital
-- Unfulfilled invoices
-
-#### Technical Assets:
-- Computer Systems
-- Driver Mobile App
-- Admin Panel
-- OSRM / Traccar - GPS and Route Calculation
-- Current Operations Database
-- Server Space
+- Operations and Support team
+- Driver allocation and accounting system
+- Insurance and Legal coverage
 
 <div style="page-break-after: always;"></div>
 
 
 ### 7) Key Partners:
 
-#### Current:
-
-- Car Service Centers / Showrooms
-- Hotels , Marriage Halls and other Hospitality Centres
-- End Customers
-
-#### Compliance:
-
-- Drivers - TDS , PF , ESIC
-- Clients - GST, TDS 
-- Self : Income Tax Filing
-
-#### Future:
-
-- Insurance Providers
-- Driver recruitment SOPs
-- Marketing Partners
-- Insurance Provider
-- Customer Relationships 
-- Driver Relationships
+- Service Centers , Showrooms ,Hotels
+- End Customers - Independant
+- Drivers - Independant 
+- Tech Providers - Doocti, Infra and Tech Team
+- Insurance provider
 
 ### 8) Key Activities:
 
-#### Internal Team:
-
-- Call Center - Operations
-- Accounts
-- Supervisors
-
-##### Activities:
-- Booking and Driver Allotment
-- Billing and invoicing Clients
-- TDS and PF compliance
-
-##### Future Scope:
-- HR + Marketing
-- Customer Relations + Liability
-- Operations + On Site
-
-#### Driver:
-- Driver Uniform 
-- Driver recruitment
-- Driver onboarding
-- Driver allocation
-- Driver Payments
-- Uniform management
-
-#### Client Side - Corporate:
-- Valet driver services - Monthly & Acting 
-- Service-center driver coordination
-- Bill Book and Slip Maintenance
-
-#### Client Side - Customer:
-
-#### Rydcare Current:
-- Booking management
-- Driver management
-- Location tracking
-- Digital trip records
-- Tariff management
-- Client dashboards
-- Driver mobile application
-
-Future scope:
-
-- Notifications and communication 
-- Driver Payouts - Bulk
-- Invoice Management
-- OCR-based billing/data entry
-- Accident and Debits management
+- Brand building
+- Digital Marketing 
+- Driver recruitment and onboarding
+- Client Acquisition + onboarding with compliance
+- Fulfill driver requests from corporates
+- Driver retention and management
+- Trips management - Tracking , verifying and accounting
+- Client management
+- Tech platform development and maintenance
 
 <div style="page-break-after: always;"></div>
 
 ### 9) Costs:
 
-- *Insurance for Accidents*
-
-#### Office Costs:
-
-##### Current
-
-- Office Rent
-- Electricity
-- Office Supplies - Paper, Stationery, Toiletries, Refreshments
-- Employee Salaries
-- Maintenace and Cleaning Costs
-- PRI Line 
-
-Next:
-
-- Employee Leisure, Insurance and PF 
-- Doocti Integration
-
-##### Car Service Center / Showroom Corporate Costs:
-
-Current:
-- Driver Uniform (T-Shirt)
-- Bill Books
-- Accident Debits
-- Miscellaneous
-- Supervisor costs allowances
-- Bus Pass - Optional
-- Room Rent
-- Insurance
-
-#### Hotels / Marriage Halls / Hospitality Center Costs:
-
-- Uniform ( Hat, Coat , Pant , Shoe - Optional)
-- Pens , Books , Razors
-- Attendance Book Printing
-- Driver Food
-- PF, Esic
-- Accident Debits
-- Supervisor Lunch / Dinner
-
-##### RydCare Platform Costs:
-- 25$ Playstore Fee Paid
-- Backend & DB Hosting: VPS Available
-    - Backend Django-Ninja
-    - Postgresql - Needs Planning
-- MSG91 Whatsapp OTP : ₹500/Month - Platform Fee and Per SMS - ₹0.115 / OTP
-- Media Storage / Backups S3:
-    - Black Blaze - ₹520 / TB - Egress via CloudFlare/Fastly/Digital Ocean/Bunny.net is free or ₹0.85/GB
-    - Wasabi - ₹680 / TB - Egress Free
+- Driver acquisition , and maintenance
+- Client Deliverables
+- Driver Payouts and Debits
+- Insurance 
+- Marketing
+- Office / Admin expenses
+- Employee salaries
+- Tech platform costs
